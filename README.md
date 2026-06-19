@@ -1,4 +1,4 @@
-# REFINE: Super-efficient 3D Gaussian Splatting Pruning via Rendering-Free Primitive Importance
+# [ECCV 2026] REFINE: Super-efficient 3D Gaussian Splatting Pruning via Rendering-Free Primitive Importance
 
 This repository contains the official implementation of **REFINE**, a highly accelerated 3D Gaussian Splatting (3DGS) pruning framework. Our method acts as a plug-and-play, purely post-processing pipeline that can be seamlessly applied to any pre-trained 3DGS model. 
 
@@ -66,3 +66,20 @@ python metrics.py -m /path/to/output_folder
 ```
 
 This will automatically compare your rendered frames against the ground truth dataset and provide the final quality metrics.
+
+
+
+
+
+<section class="section" id="BibTeX">
+  <div class="container is-max-desktop content">
+    <h2 class="title">BibTeX</h2>
+    <pre><code>@article{chen2026refine,
+  author = {Chen, Zhang and Wan, Shuai and Yu, Mengting and Yang, Fuzheng and Hou, Junhui},
+  title = {REFINE: Super-efficient 3D Gaussian Splatting Pruning via Rendering-Free Primitive Importance},
+  journal = {European Conference on Computer Vision (ECCV)},
+  year = {2026},
+}</code></pre>
+  </div>
+</section>
+
