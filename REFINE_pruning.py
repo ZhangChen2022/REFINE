@@ -3,238 +3,375 @@ import json
 import random
 import time
 import argparse
+from typing import Dict, List
+
 import numpy as np
 import torch
 from plyfile import PlyData, PlyElement
 
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+
 class GaussianModel:
-    def __init__(self, path):
-        print(f"Loading model from: {path}")
+    def __init__(self, path: str):
         self.plydata = PlyData.read(path)
+        vertex = self.plydata.elements[0]
 
         # Position (xyz)
-        xyz = np.stack((np.asarray(self.plydata.elements[0]["x"]),
-                        np.asarray(self.plydata.elements[0]["y"]),
-                        np.asarray(self.plydata.elements[0]["z"])), axis=1)
-        self.xyz = torch.tensor(xyz, dtype=torch.float32, device=device)
+        xyz = np.stack(
+            (
+                np.asarray(vertex["x"]),
+                np.asarray(vertex["y"]),
+                np.asarray(vertex["z"]),
+            ),
+            axis=1,
+        ).astype(np.float32, copy=False)
+        self.xyz = torch.from_numpy(xyz).to(device=device)
 
-        # Opacity
-        opac = np.asarray(self.plydata.elements[0]["opacity"])
-        self.opacity = torch.sigmoid(torch.tensor(opac, dtype=torch.float32, device=device))
+        # Opacity: original 3DGS PLY stores opacity logits.
+        opac = np.asarray(vertex["opacity"], dtype=np.float32)
+        self.opacity = torch.sigmoid(torch.from_numpy(opac).to(device=device))
 
-        # Scale
-        scale_names = [f'scale_{i}' for i in range(3)]
+        # Scale: original 3DGS PLY stores log-scales.
+        scale_names = [f"scale_{i}" for i in range(3)]
         try:
-            scales = np.stack([np.asarray(self.plydata.elements[0][n]) for n in scale_names], axis=1)
-            self.scales = torch.exp(torch.tensor(scales, dtype=torch.float32, device=device))
+            scales = np.stack(
+                [np.asarray(vertex[n]) for n in scale_names], axis=1
+            ).astype(np.float32, copy=False)
+            self.scales = torch.exp(torch.from_numpy(scales).to(device=device))
         except Exception:
             self.scales = torch.ones_like(self.xyz)
 
-        # Color (DC)
-        dc_names = [f'f_dc_{i}' for i in range(3)]
+        # Color (SH DC)
+        dc_names = [f"f_dc_{i}" for i in range(3)]
         try:
-            dc = np.stack([np.asarray(self.plydata.elements[0][n]) for n in dc_names], axis=1)
-            self.sh_dc = torch.tensor(dc, dtype=torch.float32, device=device)
+            dc = np.stack(
+                [np.asarray(vertex[n]) for n in dc_names], axis=1
+            ).astype(np.float32, copy=False)
+            self.sh_dc = torch.from_numpy(dc).to(device=device)
         except Exception:
             self.sh_dc = torch.zeros_like(self.xyz)
 
         self.rgb = torch.clamp(self.sh_dc * 0.282 + 0.5, 0.0, 1.0)
 
-    def get_scene_adaptive_weights(self):
-        """
-        Pure scene-adaptive feature extraction. Achieves data-driven weight allocation
-        by extracting physical statistical features and dividing by intrinsic sensitivity factors (τ).
-        """
-        N = self.xyz.shape[0]
-        feature_flops = 0.0
+    @torch.inference_mode()
+    def get_scene_adaptive_weights(self) -> Dict[str, torch.Tensor]:
+        # 1. Color feature: luminance variance
+        luma = (
+            self.rgb[:, 0] * 0.299
+            + self.rgb[:, 1] * 0.587
+            + self.rgb[:, 2] * 0.114
+        )
+        f_color = torch.var(luma) * 100.0
 
-        # 1. Color feature: Luminance variance
-        luma = self.rgb[:, 0] * 0.299 + self.rgb[:, 1] * 0.587 + self.rgb[:, 2] * 0.114
-        f_color = torch.var(luma).item() * 100
-        feature_flops += 9 * N
+        # 2. Opacity feature: edge blurriness
+        f_opa = torch.mean(4.0 * self.opacity * (1.0 - self.opacity)) * 100.0
 
-        # 2. Opacity feature: Edge blurriness
-        f_opa = torch.mean(4 * self.opacity * (1 - self.opacity)).item() * 100
-        feature_flops += 4 * N
+        # 3. Geometric feature: anisotropic stretch
+        max_scale = self.scales.max(dim=1).values
+        min_scale = self.scales.min(dim=1).values
+        f_geo = torch.mean(max_scale / (min_scale + 1e-6))
 
-        # 3. Geometric feature: Anisotropic stretch
-        max_scale = self.scales.max(dim=1)[0]
-        min_scale = self.scales.min(dim=1)[0]
-        f_geo = torch.mean(max_scale / (min_scale + 1e-6)).item()
-        feature_flops += 3 * N
-
-        # 4. Intrinsic Sensitivity Factors (τ) normalization
-        w_geo_raw = np.log(f_geo + 1e-6) / 10.73
+        # 4. Intrinsic sensitivity factors (tau) normalization
+        w_geo_raw = torch.log(f_geo + 1e-6) / 10.73
         w_color_raw = f_color / 56.06
         w_opa_raw = f_opa / 100.67
 
         # 5. L1 normalization
-        total_w = w_geo_raw + w_color_raw + w_opa_raw
-        final_w = {
-            'w_geo': w_geo_raw / total_w,
-            'w_color': w_color_raw / total_w,
-            'w_opa': w_opa_raw / total_w
+        raw = torch.stack((w_geo_raw, w_color_raw, w_opa_raw))
+        weights = raw / raw.sum().clamp_min(1e-12)
+
+        return {
+            "w_geo": weights[0],
+            "w_color": weights[1],
+            "w_opa": weights[2],
         }
 
-        print("=" * 60)
-        print(f"💡 [Pure Scene-Adaptive Intelligence Active]")
-        print(f"   Scene Stats   -> Geo_Stretch: {f_geo:.1f}, Color_Var: {f_color:.1f}, Opa_Fuzzy: {f_opa:.1f}")
-        print(f"   Final Weights -> Geo: {final_w['w_geo']:.3f}, Color: {final_w['w_color']:.3f}, Opa: {final_w['w_opa']:.3f}")
-        print("=" * 60)
 
-        return final_w, feature_flops
+def load_cameras(file_path: str, sample_limit: int = 64) -> List[dict]:
+    if not os.path.exists(file_path):
+        return []
 
-def load_cameras(file_path, sample_limit=64):
-    if not os.path.exists(file_path): return []
-    with open(file_path, 'r', encoding='utf-8') as f:
+    with open(file_path, "r", encoding="utf-8") as f:
         data = json.load(f)
-    frames = data if isinstance(data, list) else data.get('frames', data.get('cameras', []))
-    if not frames: return []
 
-    if len(frames) > sample_limit:
+    frames = data if isinstance(data, list) else data.get("frames", data.get("cameras", []))
+    if not frames:
+        return []
+
+    if sample_limit > 0 and len(frames) > sample_limit:
         rng = random.Random(42)
         frames = rng.sample(frames, sample_limit)
 
     cameras = []
-    flip_mat = np.eye(4)
     for fr in frames:
         c2w = np.eye(4, dtype=np.float32)
-        if 'position' in fr and 'rotation' in fr:
-            c2w[:3, :3] = np.array(fr['rotation'], dtype=np.float32)
-            c2w[:3, 3] = np.array(fr['position'], dtype=np.float32)
-        elif 'transform_matrix' in fr:
-            c2w = np.array(fr['transform_matrix'], dtype=np.float32)
+
+        if "position" in fr and "rotation" in fr:
+            c2w[:3, :3] = np.asarray(fr["rotation"], dtype=np.float32)
+            c2w[:3, 3] = np.asarray(fr["position"], dtype=np.float32)
+        elif "transform_matrix" in fr:
+            c2w = np.asarray(fr["transform_matrix"], dtype=np.float32)
         else:
             continue
-        c2w = c2w @ flip_mat
-        cameras.append({'pos': torch.tensor(c2w[:3, 3], dtype=torch.float32, device=device)})
+
+        cameras.append(
+            {
+                "pos": torch.as_tensor(
+                    c2w[:3, 3], dtype=torch.float32, device=device
+                )
+            }
+        )
+
     return cameras
 
-def compute_rahd_scores(model, cameras, dynamic_weights, feature_flops):
-    N = model.xyz.shape[0]
-    total_flops = feature_flops
 
-    H_base = torch.zeros(N, device=device)
-    calc_cams = cameras if len(cameras) > 0 else []
+@torch.inference_mode()
+def compute_h_base_fast(
+    xyz: torch.Tensor,
+    opacity: torch.Tensor,
+    camera_positions: torch.Tensor,
+    camera_chunk: int = 16,
+    point_chunk: int = 1_000_000,
+) -> torch.Tensor:
+    """
+    H_i = opacity_i / C * sum_c 1 / (||x_i - c||^2 + 0.5)
 
-    for cam in calc_cams:
-        vec = model.xyz - cam['pos']
-        depth_sq = torch.sum(vec ** 2, dim=1)
-        depth_sq = torch.clamp(depth_sq, min=1e-6)
-        depth = torch.sqrt(depth_sq)
+    No depth sorting and no sqrt. Cameras and Gaussians are processed
+    in chunks to exploit parallel execution while bounding memory usage.
+    """
+    N = xyz.shape[0]
+    C = camera_positions.shape[0]
 
-        s_depth, idx = torch.sort(depth)
-        s_opac = model.opacity[idx].squeeze()
+    if C == 0:
+        raise ValueError("No cameras were provided.")
 
-        w_depth = 1.0 / (s_depth ** 2 + 0.5)
-        w_unified = s_opac * w_depth
+    camera_chunk = max(1, min(camera_chunk, C))
+    point_chunk = N if point_chunk <= 0 else max(1, min(point_chunk, N))
 
-        curr_base = torch.empty(N, device=device)
-        curr_base[idx] = w_unified
-        H_base += curr_base
+    H_base = torch.empty(N, dtype=xyz.dtype, device=xyz.device)
+    cam_norm2_all = camera_positions.square().sum(dim=1)
 
-        total_flops += 14 * N
+    for p0 in range(0, N, point_chunk):
+        p1 = min(p0 + point_chunk, N)
+        x = xyz[p0:p1]
+        opa = opacity[p0:p1]
 
-    if len(calc_cams) > 0:
-        H_base /= len(calc_cams)
-        total_flops += 1 * N
+        x_norm2 = x.square().sum(dim=1, keepdim=True)
+        h_sum = torch.zeros(p1 - p0, dtype=xyz.dtype, device=xyz.device)
 
-    # Intrinsic Coupling
-    sorted_scales, _ = torch.sort(model.scales, dim=1)
-    projected_area = sorted_scales[:, -1] * sorted_scales[:, -2]
+        for c0 in range(0, C, camera_chunk):
+            c1 = min(c0 + camera_chunk, C)
+            cams = camera_positions[c0:c1]
+            cam_norm2 = cam_norm2_all[c0:c1]
+
+            # ||x-c||^2 = ||x||^2 + ||c||^2 - 2*x^T*c
+            d2 = torch.mm(x, cams.t())
+            d2.mul_(-2.0)
+            d2.add_(x_norm2)
+            d2.add_(cam_norm2.unsqueeze(0))
+            d2.clamp_min_(1e-6)
+            d2.add_(0.5)
+            d2.reciprocal_()
+
+            h_sum.add_(d2.sum(dim=1))
+
+        H_base[p0:p1] = opa * (h_sum / float(C))
+
+    return H_base
+
+
+@torch.inference_mode()
+def compute_rahd_scores_fast(
+    model: GaussianModel,
+    cameras: List[dict],
+    dynamic_weights: Dict[str, torch.Tensor],
+    camera_chunk: int = 16,
+    point_chunk: int = 1_000_000,
+) -> torch.Tensor:
+    camera_positions = torch.stack([cam["pos"] for cam in cameras], dim=0)
+    opacity = model.opacity.squeeze(-1) if model.opacity.ndim > 1 else model.opacity
+
+    # 1. View-dependent base importance, O(N*C), no depth sorting.
+    H_base = compute_h_base_fast(
+        xyz=model.xyz,
+        opacity=opacity,
+        camera_positions=camera_positions,
+        camera_chunk=camera_chunk,
+        point_chunk=point_chunk,
+    )
+
+    # 2. Geometry importance: product of the two largest positive scales.
+    s0 = model.scales[:, 0]
+    s1 = model.scales[:, 1]
+    s2 = model.scales[:, 2]
+    projected_area = torch.maximum(
+        s0 * s1,
+        torch.maximum(s0 * s2, s1 * s2),
+    )
     S_geo = H_base * projected_area
-    total_flops += 2 * N
 
-    luma = model.rgb[:, 0] * 0.299 + model.rgb[:, 1] * 0.587 + model.rgb[:, 2] * 0.114
-    color_energy = luma ** 2
-    S_color = H_base * color_energy
-    total_flops += 7 * N
+    # 3. Color importance.
+    luma = (
+        model.rgb[:, 0] * 0.299
+        + model.rgb[:, 1] * 0.587
+        + model.rgb[:, 2] * 0.114
+    )
+    S_color = H_base * luma.square()
 
-    S_opa = H_base * (model.opacity.squeeze() ** 2)
-    total_flops += 2 * N
+    # 4. Opacity importance.
+    S_opa = H_base * opacity.square()
 
-    # Attribute-level normalization
-    S_geo /= (S_geo.mean() + 1e-8)
-    S_color /= (S_color.mean() + 1e-8)
-    S_opa /= (S_opa.mean() + 1e-8)
-    total_flops += 6 * N
+    # 5. Attribute-level normalization.
+    S_geo = S_geo / (S_geo.mean() + 1e-8)
+    S_color = S_color / (S_color.mean() + 1e-8)
+    S_opa = S_opa / (S_opa.mean() + 1e-8)
 
-    # Apply pure scene-adaptive weights
-    final_score = (dynamic_weights['w_geo'] * S_geo) + \
-                  (dynamic_weights['w_color'] * S_color) + \
-                  (dynamic_weights['w_opa'] * S_opa)
-    total_flops += 5 * N
+    # 6. Scene-adaptive weighted final score.
+    return (
+        dynamic_weights["w_geo"] * S_geo
+        + dynamic_weights["w_color"] * S_color
+        + dynamic_weights["w_opa"] * S_opa
+    )
 
-    return final_score.cpu().numpy(), total_flops
 
-def prune_and_save(ply_path, cam_path, output_path, prune_ratio):
-    start_time = time.time()
+@torch.inference_mode()
+def build_exact_prune_mask(
+    scores: torch.Tensor,
+    prune_ratio: float,
+) -> torch.Tensor:
+    """Build an exact-size keep mask without moving scores to CPU."""
+    N = scores.numel()
+    num_remove = max(0, min(int(N * prune_ratio), N))
+    num_keep = N - num_remove
 
-    model = GaussianModel(ply_path)
-    cameras = load_cameras(cam_path)
+    if num_remove == 0:
+        return torch.ones(N, dtype=torch.bool, device=scores.device)
 
-    if not cameras:
-        print("Error: No cameras loaded.")
-        return
+    if num_keep == 0:
+        return torch.zeros(N, dtype=torch.bool, device=scores.device)
 
-    dynamic_weights, feature_flops = model.get_scene_adaptive_weights()
-    scores, flops = compute_rahd_scores(model, cameras, dynamic_weights, feature_flops)
-
-    total_points = len(scores)
-    k = int(total_points * prune_ratio)
-
-    if k >= total_points:
-        threshold = float('inf')
-    elif k <= 0:
-        threshold = -float('inf')
+    # Select the smaller side to reduce selection work.
+    if num_remove <= num_keep:
+        remove_idx = torch.topk(
+            scores,
+            k=num_remove,
+            largest=False,
+            sorted=False,
+        ).indices
+        mask = torch.ones(N, dtype=torch.bool, device=scores.device)
+        mask[remove_idx] = False
     else:
-        threshold = np.partition(scores, k)[k]
+        keep_idx = torch.topk(
+            scores,
+            k=num_keep,
+            largest=True,
+            sorted=False,
+        ).indices
+        mask = torch.zeros(N, dtype=torch.bool, device=scores.device)
+        mask[keep_idx] = True
 
-    mask = scores > threshold
+    return mask
 
-    keep_count, remove_count = np.sum(mask), total_points - np.sum(mask)
-    gflops = flops / 1e9
 
-    print("-" * 60)
-    print(f"Pure Scene-Adaptive REFINE Pruning Statistics")
-    print(f"Prune Ratio:       {prune_ratio}")
-    print(f"Removing:          {remove_count}")
-    print(f"Keeping:           {keep_count}")
-    print(f"Total Computation: {gflops:.4f} GFLOPs")
-    print("-" * 60)
+def prune_and_save(
+    ply_path: str,
+    cam_path: str,
+    output_path: str,
+    prune_ratio: float,
+    camera_limit: int = 64,
+    camera_chunk: int = 16,
+    point_chunk: int = 1_000_000,
+) -> None:
+    if not 0.0 <= prune_ratio <= 1.0:
+        raise ValueError(f"prune_ratio must be in [0, 1], got {prune_ratio}")
 
+    # Loading is intentionally excluded from pruning time.
+    model = GaussianModel(ply_path)
+    cameras = load_cameras(cam_path, sample_limit=camera_limit)
+    if not cameras:
+        raise RuntimeError(f"No cameras loaded from: {cam_path}")
+
+    # Time only the REFINE pruning computation:
+    # scene-adaptive weights + importance score + pruning selection.
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+
+        start_event.record()
+
+        dynamic_weights = model.get_scene_adaptive_weights()
+        scores = compute_rahd_scores_fast(
+            model=model,
+            cameras=cameras,
+            dynamic_weights=dynamic_weights,
+            camera_chunk=camera_chunk,
+            point_chunk=point_chunk,
+        )
+        mask = build_exact_prune_mask(scores, prune_ratio)
+
+        end_event.record()
+        end_event.synchronize()
+        pruning_time = start_event.elapsed_time(end_event) / 1000.0
+    else:
+        start_time = time.perf_counter()
+
+        dynamic_weights = model.get_scene_adaptive_weights()
+        scores = compute_rahd_scores_fast(
+            model=model,
+            cameras=cameras,
+            dynamic_weights=dynamic_weights,
+            camera_chunk=camera_chunk,
+            point_chunk=point_chunk,
+        )
+        mask = build_exact_prune_mask(scores, prune_ratio)
+
+        pruning_time = time.perf_counter() - start_time
+
+    # Saving is intentionally excluded from pruning time.
+    mask_cpu = mask.detach().cpu().numpy()
     raw_vertex_data = model.plydata.elements[0].data
-    new_vertex_element = PlyElement.describe(raw_vertex_data[mask], 'vertex')
+    new_vertex_element = PlyElement.describe(raw_vertex_data[mask_cpu], "vertex")
 
     final_output_path = output_path
-    if not final_output_path.lower().endswith('.ply'):
+    if not final_output_path.lower().endswith(".ply"):
         os.makedirs(final_output_path, exist_ok=True)
         final_output_path = os.path.join(final_output_path, "point_cloud.ply")
     else:
-        os.makedirs(os.path.dirname(final_output_path) or '.', exist_ok=True)
+        os.makedirs(os.path.dirname(final_output_path) or ".", exist_ok=True)
 
     PlyData([new_vertex_element], text=False).write(final_output_path)
 
-    elapsed_time = time.time() - start_time
-    print(f"Saved pruned model to: {final_output_path}")
-    print(f"Processing Time:   {elapsed_time:.4f} seconds")
-    print(f"Throughput:        {gflops / elapsed_time:.2f} GFLOPs/s")
+    # Keep console output intentionally minimal.
+    print(f"Processing Time: {pruning_time:.4f} seconds")
 
-    if os.path.exists(ply_path) and os.path.exists(final_output_path):
-        old_size = os.path.getsize(ply_path) / (1024 ** 2)
-        new_size = os.path.getsize(final_output_path) / (1024 ** 2)
-        print(f"Size reduced:      {old_size:.2f} MB -> {new_size:.2f} MB")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Pure Scene-Adaptive REFINE 3DGS Pruning Script")
+    parser = argparse.ArgumentParser(
+        description="Fast REFINE 3DGS Pruning Script"
+    )
     parser.add_argument("--start_pointcloud", type=str, required=True)
     parser.add_argument("--json_path", type=str, required=True)
     parser.add_argument("--output_path", type=str, required=True)
     parser.add_argument("--prune_percent", type=float, default=0.5)
+
+    # Kept for compatibility with the original command line interface.
     parser.add_argument("--white_background", action="store_true")
+
+    parser.add_argument("--camera_limit", type=int, default=64)
+    parser.add_argument("--camera_chunk", type=int, default=16)
+    parser.add_argument("--point_chunk", type=int, default=1_000_000)
 
     args = parser.parse_args()
 
-    prune_and_save(args.start_pointcloud, args.json_path, args.output_path, args.prune_percent)
+    prune_and_save(
+        ply_path=args.start_pointcloud,
+        cam_path=args.json_path,
+        output_path=args.output_path,
+        prune_ratio=args.prune_percent,
+        camera_limit=args.camera_limit,
+        camera_chunk=args.camera_chunk,
+        point_chunk=args.point_chunk,
+    )

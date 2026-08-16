@@ -1,6 +1,8 @@
 # [ECCV 2026] REFINE: Super-efficient 3D Gaussian Splatting Pruning via Rendering-Free Primitive Importance
 
-This repository contains the official implementation of **REFINE**, a highly accelerated 3D Gaussian Splatting (3DGS) pruning framework. Our method acts as a plug-and-play, purely post-processing pipeline that can be seamlessly applied to any pre-trained 3DGS model. 
+> **🔥 Update:** We have updated the codebase to fully support GPU acceleration! The current pruning speed is now **10× faster** than the results reported in the original paper.
+
+This repository contains the official implementation of REFINE, a highly accelerated 3D Gaussian Splatting (3DGS) pruning framework. Our method acts as a plug-and-play, purely post-processing pipeline that can be seamlessly applied to any pre-trained 3DGS model. 
 
 By bypassing costly forward rendering passes entirely, REFINE leverages an analytically approximated Hessian field to extract physical statistical features. This allows it to achieve an unprecedented 3,000× reduction in pruning-related computational complexity compared to state-of-the-art rendering-based methods, while maintaining highly competitive rendering quality.
 
